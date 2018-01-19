@@ -1,296 +1,282 @@
-/**
- * E1.31 (sACN) library for C/C++
- * Hugo Hromic - http://github.com/hhromic
- *
- * Some content of this file is based on:
- * https://github.com/forkineye/E131/blob/master/E131.h
- * https://github.com/forkineye/E131/blob/master/E131.cpp
- *
- * Copyright 2016 Hugo Hromic
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
+#define E131_DEBUG
 #include <string.h>
-#include <errno.h>
 #include <inttypes.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
 #include "e131.h"
+
+#ifdef E131_DEBUG
+#include <stdio.h>
+#endif
 
 /* E1.31 Public Constants */
 const uint16_t E131_DEFAULT_PORT = 5568;
 const uint8_t E131_DEFAULT_PRIORITY = 0x64;
 
+const size_t E131_CID_LEN = 16;
+const size_t E131_SOURCENAME_LEN = 64;
+
 /* E1.31 Private Constants */
 const uint16_t _E131_PREAMBLE_SIZE = 0x0010;
 const uint16_t _E131_POSTAMBLE_SIZE = 0x0000;
 const uint8_t _E131_ACN_PID[] = {0x41, 0x53, 0x43, 0x2d, 0x45, 0x31, 0x2e, 0x31, 0x37, 0x00, 0x00, 0x00};
-const uint32_t _E131_ROOT_VECTOR = 0x00000004;
-const uint32_t _E131_FRAME_VECTOR = 0x00000002;
-const uint8_t _E131_DMP_VECTOR = 0x02;
-const uint8_t _E131_DMP_TYPE = 0xa1;
-const uint16_t _E131_DMP_FIRST_ADDR = 0x0000;
-const uint16_t _E131_DMP_ADDR_INC = 0x0001;
 
-/* Create a socket file descriptor suitable for E1.31 communication */
-int e131_socket(void) {
-  return socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+/* E1.31 private enums */
+enum E131_VECTOR_ROOT {
+  VECTOR_ROOT_E131_DATA = 0x00000004,
+  VECTOR_ROOT_E131_EXTENDED = 0x00000008,
+};
+
+enum E131_VECTOR_E131_DATA {
+  VECTOR_E131_DATA_PACKET = 0x00000002,
+};
+enum E131_VECTOR_E131_EXTENDED {
+  VECTOR_E131_EXTENDED_SYNCHRONIZATION = 0x00000001,
+  VECTOR_E131_EXTENDED_DISCOVERY = 0x00000002,
+};
+
+enum E131_VECTOR_UNIVERSE_DISCOVERY {
+  VECTOR_UNIVERSE_DISCOVERY_UNIVERSE_LIST = 0x00000001,
+};
+
+const uint32_t E131_UNIVERSE_DISCOVERY_INTERVAL = 10000; // 10s
+const uint32_t E131_NETWORK_DATA_LOSS_TIMEOUT = 2500; // 2.5s
+
+
+typedef uint32_t acn_vector_t;
+typedef struct acn_root_layer_s {
+  acn_vector_t vector;      // Vector (VECTOR_ROOT_E131_DATA or VECTOR_ROOT_E131_EXTENDED)
+  uint8_t *cid_p; // Sender's CID (unique ID)
+} acn_root_layer_t;
+
+typedef struct e131_framing_layer_data_s {
+  acn_vector_t vector;      // Vector (VECTOR_E131_DATA_PACKET)
+  uint8_t *source_name_p;   // Pointer to User Assigned name of Source (UTF-8, null-terminated)
+  uint8_t priority;         // Data priority if multiple sources (0-200, default of 100)
+  e131_universe_t sync_addr; // Universe address on which sync packets will be sent
+  uint8_t seq;              // Sequence Number
+  uint8_t options;          // Options Flags
+  e131_universe_t universe; // Universe Number
+} e131_framing_layer_data_t;
+
+typedef struct e131_framing_layer_sync_s {
+  acn_vector_t vector;      // Vector (VECTOR_E131_EXTENDED_SYNCHRONIZATION)
+  uint8_t seq;              // Sequence Number
+  e131_universe_t sync_addr; // Universe address on which sync packets will be sent
+} e131_framing_layer_sync_t;
+
+typedef struct e131_framing_layer_discovery_s {
+  acn_vector_t vector;      // Vector (VECTOR_E131_EXTENDED_DISCOVERY)
+  uint8_t *source_name_p;  // User Assigned name of Source (UTF-8, null-terminated)
+} e131_framing_layer_discovery_t;
+
+typedef struct e131_dmp_layer_data_s {
+  uint16_t value_count;      // Number of channels + 1
+  uint8_t *value_ptr;        // Pointer to the data
+} e131_dmp_layer_data_t;
+
+typedef struct e131_data_packet_s {
+  acn_root_layer_t root;
+  e131_framing_layer_data_t framing;
+  e131_dmp_layer_data_t dmp;
+} e131_data_packet_t;
+
+typedef struct e131_sync_packet_s {
+  acn_root_layer_t root;
+  e131_framing_layer_sync_t framing;
+} e131_sync_packet_t;
+
+
+uint32_t _be32toh(uint8_t *ptr){
+  return (ptr[0] << 24) | (ptr[1] << 16) | (ptr[2] << 8) | (ptr[3] << 0);
 }
 
-/* Bind a socket file descriptor to a port number for E1.31 communication */
-int e131_bind(int sockfd, const uint16_t port) {
-  e131_addr_t addr;
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port = htons(port);
-  memset(addr.sin_zero, 0, sizeof addr.sin_zero);
-  return bind(sockfd, (struct sockaddr *)&addr, sizeof addr);
+uint16_t _be16toh(uint8_t *ptr){
+  return (ptr[0] << 8) | (ptr[1] << 0);
 }
 
-/* Initialize a unicast E1.31 destination using a host and port number */
-int e131_unicast_dest(e131_addr_t *dest, const char *host, const uint16_t port) {
-  if (dest == NULL || host == NULL) {
-    errno = EINVAL;
+void e131_swap(e131_t *o, size_t u) {
+    // swap active - inactive
+    dmx_t *tmp = o->universes[u].active;
+    o->universes[u].active = o->universes[u].inactive;
+    o->universes[u].inactive = tmp;
+}
+
+void e131_handle_sync(e131_t *o, e131_sync_packet_t *pkt) {
+  e131_universe_t universe = pkt->framing.sync_addr;
+
+  if (universe == 0)
+    return;
+
+  if (universe >= o->first_addr && universe < o->first_addr+o->num_universes) {
+    size_t i = universe - o->first_addr;
+
+    // check if packet is in order
+    uint8_t seq = pkt->framing.seq;
+    if (seq > o->universes[i].sync_seq || o->universes[i].sync_seq - seq > 20) {
+      o->universes[i].sync_seq = seq;
+
+      for (size_t u = 0; u < o->num_universes; u++) {
+        if (o->universes[u].sync_addr == universe) {
+          e131_swap(o, u);
+        }
+      }
+    }
+  }
+}
+
+void e131_handle_data(e131_t *o, e131_data_packet_t *pkt) {
+  e131_universe_t universe = pkt->framing.universe;
+
+  if (universe >= o->first_addr && universe < o->first_addr+o->num_universes) {
+    e131_universe_t i = universe - o->first_addr;
+
+    // check if packet is in order
+    uint8_t seq = pkt->framing.seq;
+
+    if (seq > o->universes[i].data_seq || o->universes[i].data_seq - seq > 20) {
+      o->universes[i].data_seq = seq;
+
+      // TODO: check options
+
+      // copy data
+      if (pkt->dmp.value_count > 1) {
+        size_t num = (pkt->dmp.value_count-1 <= E131_UNIVERSE_LEN ?
+          pkt->dmp.value_count-1 : 
+          E131_UNIVERSE_LEN); 
+        o->universes[i].inactive->startcode = pkt->dmp.value_ptr[0];
+        memcpy(o->universes[i].inactive->data, &(pkt->dmp.value_ptr[1]), num);
+      }
+
+      // update sync address
+      o->universes[i].sync_addr = pkt->framing.sync_addr;
+      printf("Sync: %d\n", pkt->framing.sync_addr);
+
+      if (o->universes[i].sync_addr == 0) {
+        e131_swap(o, i);
+      }
+    }
+
+  }
+
+}
+
+int e131_parse_packet(e131_t *o, uint8_t *buf, size_t len) {
+  int ret;
+
+  acn_root_layer_t root;
+
+  // parse root layer
+  if (len < 38) {
+    // too short to contain the ACN root layer
     return -1;
   }
-  struct hostent *he = gethostbyname(host);
-  if (he == NULL) {
-    errno = EADDRNOTAVAIL;
+  if (_be16toh(buf) != _E131_PREAMBLE_SIZE ) {
+    // invalid preable size
     return -1;
   }
-  dest->sin_family = AF_INET;
-  dest->sin_addr = *(struct in_addr *)he->h_addr;
-  dest->sin_port = htons(port);
-  memset(dest->sin_zero, 0, sizeof dest->sin_zero);
-  return 0;
-}
-
-/* Initialize a multicast E1.31 destination using a universe and port number */
-int e131_multicast_dest(e131_addr_t *dest, const uint16_t universe, const uint16_t port) {
-  if (dest == NULL || universe < 1 || universe > 63999) {
-    errno = EINVAL;
+  if (_be16toh(buf+2) != _E131_POSTAMBLE_SIZE ) {
+    // invalid post-amble size
     return -1;
   }
-  dest->sin_family = AF_INET;
-  dest->sin_addr.s_addr = htonl(0xefff0000 | universe);
-  dest->sin_port = htons(port);
-  memset(dest->sin_zero, 0, sizeof dest->sin_zero);
-  return 0;
-}
-
-/* Describe an E1.31 destination into a string */
-int e131_dest_str(char *str, const e131_addr_t *dest) {
-  if (str == NULL || dest == NULL) {
-    errno = EINVAL;
+  if (memcmp(buf+4, _E131_ACN_PID, sizeof(_E131_ACN_PID) ) != 0) {
+    //invalid ACN PACKET ID
     return -1;
   }
-  sprintf(str, "%s:%d", inet_ntoa(dest->sin_addr), ntohs(dest->sin_port));
-  return 0;
-}
+  uint16_t root_length = ((0x0f & buf[16]) << 8) | buf[17];
 
-/* Join a socket file descriptor to an E1.31 multicast group using a universe */
-int e131_multicast_join(int sockfd, const uint16_t universe) {
-  if (universe < 1 || universe > 63999) {
-    errno = EINVAL;
-    return -1;
-  }
-  struct ip_mreqn mreq;
-  mreq.imr_multiaddr.s_addr = htonl(0xefff0000 | universe);
-  mreq.imr_address.s_addr = htonl(INADDR_ANY);
-  mreq.imr_ifindex = 0;
-  return setsockopt(sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof mreq);
-}
-
-/* Initialize an E1.31 packet using a universe and a number of slots */
-int e131_pkt_init(e131_packet_t *packet, const uint16_t universe, const uint16_t num_slots) {
-  if (packet == NULL || universe < 1 || universe > 63999 || num_slots < 1 || num_slots > 512) {
-    errno = EINVAL;
+  if (root_length + 16 > len) {
     return -1;
   }
 
-  // compute packet layer lengths
-  uint16_t prop_val_cnt = num_slots + 1;
-  uint16_t dmp_length = prop_val_cnt +
-    sizeof packet->dmp - sizeof packet->dmp.prop_val;
-  uint16_t frame_length = sizeof packet->frame + dmp_length;
-  uint16_t root_length = sizeof packet->root.flength +
-    sizeof packet->root.vector + sizeof packet->root.cid + frame_length;
+  acn_vector_t root_vector = _be32toh(buf+18);
 
-  // clear packet
-  memset(packet, 0, sizeof *packet);
+  uint8_t *root_cid_p = buf+22;
 
-  // set Root Layer values
-  packet->root.preamble_size = htons(_E131_PREAMBLE_SIZE);
-  packet->root.postamble_size = htons(_E131_POSTAMBLE_SIZE);
-  memcpy(packet->root.acn_pid, _E131_ACN_PID, sizeof packet->root.acn_pid);
-  packet->root.flength = htons(0x7000 | root_length);
-  packet->root.vector = htonl(_E131_ROOT_VECTOR);
+  if(root_vector == VECTOR_ROOT_E131_DATA) {
 
-  // set Framing Layer values
-  packet->frame.flength = htons(0x7000 | frame_length);
-  packet->frame.vector = htonl(_E131_FRAME_VECTOR);
-  packet->frame.priority = E131_DEFAULT_PRIORITY;
-  packet->frame.universe = htons(universe);
+    e131_data_packet_t pkt;
+    pkt.root.vector = root_vector;
+    pkt.root.cid_p  = root_cid_p;
 
-  // set Device Management Protocol (DMP) Layer values
-  packet->dmp.flength = htons(0x7000 | dmp_length);
-  packet->dmp.vector = _E131_DMP_VECTOR;
-  packet->dmp.type = _E131_DMP_TYPE;
-  packet->dmp.first_addr = htons(_E131_DMP_FIRST_ADDR);
-  packet->dmp.addr_inc = htons(_E131_DMP_ADDR_INC);
-  packet->dmp.prop_val_cnt = htons(prop_val_cnt);
+    // DATA packet
+    if (len < 124) {
+      // too short
+      return -1;
+    }
 
-  return 0;
-}
+    uint16_t framing_length = ((0x0f & buf[38]) << 8) | buf[39];
 
-/* Get the state of a framing option in an E1.31 packet */
-bool e131_get_option(const e131_packet_t *packet, const e131_option_t option) {
-  if (packet == NULL || packet->frame.options & (1 << (option % 8)))
-    return false;
-  return true;
-}
+    if (framing_length + 38 > len) {
+      return -1;
+    }
 
-/* Set the state of a framing option in an E1.31 packet */
-int e131_set_option(e131_packet_t *packet, const e131_option_t option, const bool state) {
-  if (packet == NULL) {
-    errno = EINVAL;
-    return -1;
-  }
-  packet->frame.options ^= (-state ^ packet->frame.options) & (1 << (option % 8));
-  return 0;
-}
+    pkt.framing.vector = _be32toh(buf+40);
 
-/* Send an E1.31 packet to a socket file descriptor using a destination */
-ssize_t e131_send(int sockfd, const e131_packet_t *packet, const e131_addr_t *dest) {
-  if (packet == NULL || dest == NULL) {
-    errno = EINVAL;
-    return -1;
-  }
-  const size_t packet_length = sizeof packet->raw -
-    sizeof packet->dmp.prop_val + htons(packet->dmp.prop_val_cnt);
-  return sendto(sockfd, packet->raw, packet_length, 0,
-    (const struct sockaddr *)dest, sizeof *dest);
-}
+    if (pkt.framing.vector != VECTOR_E131_DATA_PACKET) {
+      return -1;
+    }
+    pkt.framing.source_name_p = buf+44;
+    pkt.framing.priority = buf[108];
+    pkt.framing.sync_addr = _be16toh(buf+109);
+    pkt.framing.seq = buf[111];
+    pkt.framing.options = buf[112];
+    pkt.framing.universe = _be16toh(buf+113);
 
-/* Receive an E1.31 packet from a socket file descriptor */
-ssize_t e131_recv(int sockfd, e131_packet_t *packet) {
-  if (packet == NULL) {
-    errno = EINVAL;
-    return -1;
-  }
-  return recv(sockfd, packet->raw, sizeof packet->raw, 0);
-}
+    pkt.dmp.value_count = _be16toh(buf+123);
+    if (len < 124+pkt.dmp.value_count) {
+      return -1;
+    }
+    pkt.dmp.value_ptr = buf+125;
 
-/* Validate that an E1.31 packet is well-formed */
-e131_error_t e131_pkt_validate(const e131_packet_t *packet) {
-  if (packet == NULL)
-    return E131_ERR_NULLPTR;
-  if (ntohs(packet->root.preamble_size) != _E131_PREAMBLE_SIZE)
-    return E131_ERR_PREAMBLE_SIZE;
-  if (ntohs(packet->root.postamble_size) != _E131_POSTAMBLE_SIZE)
-    return E131_ERR_POSTAMBLE_SIZE;
-  if (memcmp(packet->root.acn_pid, _E131_ACN_PID, sizeof packet->root.acn_pid) != 0)
-    return E131_ERR_ACN_PID;
-  if (ntohl(packet->root.vector) != _E131_ROOT_VECTOR)
-    return E131_ERR_VECTOR_ROOT;
-  if (ntohl(packet->frame.vector) != _E131_FRAME_VECTOR)
-    return E131_ERR_VECTOR_FRAME;
-  if (packet->dmp.vector != _E131_DMP_VECTOR)
-    return E131_ERR_VECTOR_DMP;
-  if (packet->dmp.type != _E131_DMP_TYPE)
-    return E131_ERR_TYPE_DMP;
-  if (htons(packet->dmp.first_addr) != _E131_DMP_FIRST_ADDR)
-    return E131_ERR_FIRST_ADDR_DMP;
-  if (htons(packet->dmp.addr_inc) != _E131_DMP_ADDR_INC)
-    return E131_ERR_ADDR_INC_DMP;
-  return E131_ERR_NONE;
-}
+#ifdef E131_DEBUG
+printf("Data packet received\n");
+#endif
 
-/* Check if an E1.31 packet should be discarded (sequence number out of order) */
-bool e131_pkt_discard(const e131_packet_t *packet, const uint8_t last_seq_number) {
-  if (packet == NULL)
-    return true;
-  int8_t seq_num_diff = packet->frame.seq_number - last_seq_number;
-  if (seq_num_diff > -20 && seq_num_diff <= 0)
-    return true;
-  return false;
-}
+    // call "data recv callback"
+    e131_handle_data(o, &pkt);
 
-/* Dump an E1.31 packet to a stream (i.e. stdout, stderr) */
-int e131_pkt_dump(FILE *stream, const e131_packet_t *packet) {
-  if (stream == NULL || packet == NULL) {
-    errno = EINVAL;
-    return -1;
-  }
-  fprintf(stream, "[Root Layer]\n");
-  fprintf(stream, "  Preamble Size .......... %" PRIu16 "\n", ntohs(packet->root.preamble_size));
-  fprintf(stream, "  Post-amble Size ........ %" PRIu16 "\n", ntohs(packet->root.postamble_size));
-  fprintf(stream, "  ACN Packet Identifier .. %s\n", packet->root.acn_pid);
-  fprintf(stream, "  Flags & Length ......... %" PRIu16 "\n", ntohs(packet->root.flength));
-  fprintf(stream, "  Layer Vector ........... %" PRIu32 "\n", ntohl(packet->root.vector));
-  fprintf(stream, "  Component Identifier ... ");
-  for (size_t pos=0, total=sizeof packet->root.cid; pos<total; pos++)
-    fprintf(stream, "%02x", packet->root.cid[pos]);
-  fprintf(stream, "\n");
-  fprintf(stream, "[Framing Layer]\n");
-  fprintf(stream, "  Flags & Length ......... %" PRIu16 "\n", ntohs(packet->frame.flength));
-  fprintf(stream, "  Layer Vector ........... %" PRIu32 "\n", ntohl(packet->frame.vector));
-  fprintf(stream, "  Source Name ............ %s\n", packet->frame.source_name);
-  fprintf(stream, "  Packet Priority ........ %" PRIu8 "\n", packet->frame.priority);
-  fprintf(stream, "  Reserved ............... %" PRIu16 "\n", ntohs(packet->frame.reserved));
-  fprintf(stream, "  Sequence Number ........ %" PRIu8 "\n", packet->frame.seq_number);
-  fprintf(stream, "  Options Flags .......... %" PRIu8 "\n", packet->frame.options);
-  fprintf(stream, "  DMX Universe Number .... %" PRIu16 "\n", ntohs(packet->frame.universe));
-  fprintf(stream, "[Device Management Protocol (DMP) Layer]\n");
-  fprintf(stream, "  Flags & Length ......... %" PRIu16 "\n", ntohs(packet->dmp.flength));
-  fprintf(stream, "  Layer Vector ........... %" PRIu8 "\n", packet->dmp.vector);
-  fprintf(stream, "  Address & Data Type .... %" PRIu8 "\n", packet->dmp.type);
-  fprintf(stream, "  First Address .......... %" PRIu16 "\n", ntohs(packet->dmp.first_addr));
-  fprintf(stream, "  Address Increment ...... %" PRIu16 "\n", ntohs(packet->dmp.addr_inc));
-  fprintf(stream, "  Property Value Count ... %" PRIu16 "\n", ntohs(packet->dmp.prop_val_cnt));
-  fprintf(stream, "[DMP Property Values]\n ");
-  for (size_t pos=0, total=ntohs(packet->dmp.prop_val_cnt); pos<total; pos++)
-    fprintf(stream, " %02x", packet->dmp.prop_val[pos]);
-  fprintf(stream, "\n");
-  return 0;
-}
+  } else if (root_vector == VECTOR_ROOT_E131_EXTENDED ) {
+    // EXTENDED packet (sync or discovery)
 
-/* Return a string describing an E1.31 error */
-const char *e131_strerror(const e131_error_t error) {
-  switch (error) {
-    case E131_ERR_NONE:
-      return "Success";
-    case E131_ERR_PREAMBLE_SIZE:
-      return "Invalid Preamble Size";
-    case E131_ERR_POSTAMBLE_SIZE:
-      return "Invalid Post-amble Size";
-    case E131_ERR_ACN_PID:
-      return "Invalid ACN Packet Identifier";
-    case E131_ERR_VECTOR_ROOT:
-      return "Invalid Root Layer Vector";
-    case E131_ERR_VECTOR_FRAME:
-      return "Invalid Framing Layer Vector";
-    case E131_ERR_VECTOR_DMP:
-      return "Invalid Device Management Protocol (DMP) Layer Vector";
-    case E131_ERR_TYPE_DMP:
-      return "Invalid DMP Address & Data Type";
-    case E131_ERR_FIRST_ADDR_DMP:
-      return "Invalid DMP First Address";
-    case E131_ERR_ADDR_INC_DMP:
-      return "Invalid DMP Address Increment";
-    default:
-      return "Unknown error";
+    if (len < 44) {
+      // too short
+      return -1;
+    }
+
+    uint16_t framing_length = ((0x0f & buf[38]) << 8) | buf[39];
+
+    if (framing_length + 38 > len) {
+      return -1;
+    }
+
+    acn_vector_t framing_vector = _be32toh(buf+40);
+
+
+    if (framing_vector != VECTOR_E131_EXTENDED_SYNCHRONIZATION) {
+      return -1;
+    }
+
+    // from here: this is a sync packet
+
+    e131_sync_packet_t pkt;
+    pkt.root.vector = root_vector;
+    pkt.root.cid_p  = root_cid_p;
+    pkt.framing.vector = framing_vector;
+
+    if (len < 48) {
+      // too short
+      return -1;
+    }
+
+    pkt.framing.seq = buf[44];
+    pkt.framing.sync_addr = _be16toh(buf+45);
+
+#ifdef E131_DEBUG
+printf("Sync packet received\n");
+#endif
+
+    // call "sync recv callback"
+    e131_handle_sync(o, &pkt);
   }
 }
+
+const uint32_t E131_MULTICAST_GROUP = 0xefff0000;
