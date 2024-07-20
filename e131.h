@@ -38,7 +38,6 @@ typedef struct e131_s {
 
 int e131_parse_packet(e131_t *o, uint8_t *buf, size_t len);
 
-
 #ifdef __cplusplus
 }
 #endif

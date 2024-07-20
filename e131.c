@@ -1,11 +1,6 @@
-#define E131_DEBUG
 #include <string.h>
 #include <inttypes.h>
 #include "e131.h"
-
-#ifdef E131_DEBUG
-#include <stdio.h>
-#endif
 
 /* E1.31 Public Constants */
 const uint16_t E131_DEFAULT_PORT = 5568;
@@ -148,7 +143,6 @@ void e131_handle_data(e131_t *o, e131_data_packet_t *pkt) {
 
       // update sync address
       o->universes[i].sync_addr = pkt->framing.sync_addr;
-      printf("Sync: %d\n", pkt->framing.sync_addr);
 
       if (o->universes[i].sync_addr == 0) {
         e131_swap(o, i);
@@ -227,10 +221,6 @@ int e131_parse_packet(e131_t *o, uint8_t *buf, size_t len) {
     }
     pkt.dmp.value_ptr = buf+125;
 
-#ifdef E131_DEBUG
-printf("Data packet received\n");
-#endif
-
     // call "data recv callback"
     e131_handle_data(o, &pkt);
 
@@ -269,10 +259,6 @@ printf("Data packet received\n");
 
     pkt.framing.seq = buf[44];
     pkt.framing.sync_addr = _be16toh(buf+45);
-
-#ifdef E131_DEBUG
-printf("Sync packet received\n");
-#endif
 
     // call "sync recv callback"
     e131_handle_sync(o, &pkt);
